@@ -92,6 +92,12 @@
       }
       @keyframes beam { 0%, 100% { top: 12%; } 50% { top: 86%; } }
       @media (prefers-reduced-motion: reduce) { .guide .beam { animation: none; top: 50%; } }
+      /* 誤読防止：1回目検出（未確定）時は枠を緑にして短く点滅させる */
+      .guide.confirming i { border-color: var(--ok); }
+      .guide.confirming .beam { background: var(--ok); box-shadow: 0 0 12px rgba(87, 201, 138, 0.8); animation-duration: 0.7s; }
+      .guide.blink { animation: guideblink 0.32s ease-out; }
+      @keyframes guideblink { 0% { opacity: 1; transform: translate(-50%, -50%) scale(1); } 40% { opacity: 0.35; transform: translate(-50%, -50%) scale(0.97); } 100% { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+      @media (prefers-reduced-motion: reduce) { .guide.blink { animation: none; } }
       /* success flash */
       .flash {
         position: absolute; inset: 0; background: var(--accent);
@@ -393,6 +399,7 @@
 
         var els = {
           stage: document.getElementById('stage'),
+          guide: document.querySelector('.guide'),
           video: document.getElementById('video'),
           flash: document.getElementById('flash'),
           lastScan: document.getElementById('lastScan'),
@@ -541,6 +548,20 @@
         var lastIgnored = { code: '', at: 0 };
         var detectFailCount = 0;
         var detectFailReported = false;
+        /* ---------- 誤読防止（ライブスキャンのみ） ----------
+           BarcodeDetectorが1桁誤読してもチェックディジットが偶然通ることがあるため、
+           ライブ検知では同じISBNが2回連続で検出された時だけ確定する。
+           写真読み取り・手入力は従来どおり1回で確定する（handleCode側）。 */
+        var CONFIRM_COUNT = 2;
+        var PENDING_TIMEOUT_MS = 2000;
+        var pending = { code: '', count: 0, at: 0 };
+        function resetPending() {
+          pending = { code: '', count: 0, at: 0 };
+          if (els.guide) els.guide.classList.remove('confirming');
+        }
+        function expirePending(now) {
+          if (pending.code && now - pending.at > PENDING_TIMEOUT_MS) resetPending();
+        }
 
         if (supported) {
           try {
@@ -742,6 +763,7 @@
           hideCamHelp();
           detectFailCount = 0;
           detectFailReported = false;
+          resetPending();
           els.btnScan.disabled = true;
           els.btnScanLabel.textContent = '起動中…';
           tryGetUserMedia().then(function (s) {
@@ -786,6 +808,7 @@
           scanning = false;
           detectFailCount = 0;
           detectFailReported = false;
+          resetPending();
           if (rafId) cancelAnimationFrame(rafId);
           rafId = null;
           if (stream) {
@@ -806,6 +829,7 @@
           if (!scanning) return;
           rafId = requestAnimationFrame(detectLoop);
           var now = Date.now();
+          expirePending(now);
           if (now - lastDetectAt < 140) return;
           lastDetectAt = now;
           if (els.video.readyState < 2) return;
@@ -813,7 +837,7 @@
             detectFailCount = 0;
             if (!scanning || !codes || !codes.length) return;
             for (var i = 0; i < codes.length; i++) {
-              handleCode((codes[i].rawValue || '').trim());
+              handleLiveCode((codes[i].rawValue || '').trim());
             }
           }).catch(function (err) {
             /* 単発の失敗（フレーム未準備など）は無視するが、連続する場合は
@@ -857,6 +881,48 @@
               setFeedback('ISBNではないバーコードです（' + raw.slice(0, 3) + '…）— 本はもう一方のバーコードを読み取ってください', 'warn');
             }
           }
+        }
+
+        /* ライブ専用：同じISBNが CONFIRM_COUNT 回連続で検出された時だけ
+           handleCode（確定処理）へ進む。1回目は未確定として枠を点滅させ、
+           かざし続けるよう促すだけにとどめる。 */
+        function handleLiveCode(raw) {
+          if (!/^\d{13}$/.test(raw)) return;
+          var now = Date.now();
+          expirePending(now);
+          if (!isValidIsbn13(raw)) {
+            /* 別コード（ISBN以外のEAN等）が割り込んだら連続一致は途切れる */
+            if (isEan13WithValidCheck(raw)) resetPending();
+            handleCode(raw);
+            return;
+          }
+          if (items.indexOf(raw) !== -1) {
+            /* 登録済みコードは従来どおり即時に処理する（重複通知は
+               addIsbn側のクールダウンで抑制される） */
+            resetPending();
+            handleCode(raw);
+            return;
+          }
+          if (pending.code === raw) {
+            pending.count++;
+            pending.at = now;
+          } else {
+            /* 別のISBNが来たら、そのコードの1回目として数え直す */
+            pending = { code: raw, count: 1, at: now };
+          }
+          if (pending.count >= CONFIRM_COUNT) {
+            resetPending();
+            handleCode(raw);
+            return;
+          }
+          /* 1回目：未確定。枠を短く点滅させ、かざし続けるよう促す */
+          if (els.guide) {
+            els.guide.classList.add('confirming');
+            els.guide.classList.remove('blink');
+            void els.guide.offsetWidth;
+            els.guide.classList.add('blink');
+          }
+          setFeedback('読み取り中：' + raw + ' — そのままかざし続けてください', '');
         }
 
         els.btnScan.addEventListener('click', function () {
